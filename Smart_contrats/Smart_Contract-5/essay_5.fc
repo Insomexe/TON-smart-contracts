@@ -1,0 +1,284 @@
+#include "stdlib.fc";
+
+;; Constants
+const int BOOST_ENERGY_COST = 1000;
+const int BOOST_CLICK_COST = 1000;
+const int INITIAL_ENERGY = 500;
+const int MAX_ENERGY = 1000;
+const int ENERGY_RECHARGE_INTERVAL = 10800; ;; 3 hours in seconds
+const int STAKE_DURATION = 183 * 24 * 60 * 60; ;; 7 months in seconds
+const int RESTRICTED_COOLDOWN = 2 * 7 * 24 * 60 * 60; ;; 2 weeks in seconds
+
+int not(int x) inline {
+    return 1 - x;
+}
+
+;; Data structure for contract storage
+global cell storage_data;
+
+;; Helper functions
+int current_time() inline {
+    return now(); ;; Use the built-in `now` function
+}
+
+int is_empty_cell(cell c) inline {
+    return slice_hash(c.begin_parse()) == slice_hash(begin_cell().end_cell().begin_parse());
+}
+
+int is_blacklisted(slice ip) inline {
+    var cs = storage_data.begin_parse();
+    cell blacklist = cs~load_ref();
+
+    ;; Eğer blacklist boşsa, `0` döndür
+    if (is_empty_cell(blacklist)) {
+        return 0; ;; false
+    }
+
+    ;; `slice` ile iterasyon yaparak kontrol et
+    var parser = blacklist.begin_parse();
+    while (not(parser.slice_empty?())) {
+        slice blacklisted_ip = parser~load_slice();
+        if (slice_hash(blacklisted_ip) == slice_hash(ip)) {
+            return 1; ;; true
+        }
+    }
+    return 0; ;; false
+}
+
+;; Blacklist güncelleme fonksiyonu
+() update_blacklist(slice ip, int is_add) inline {
+    var cs = storage_data.begin_parse();
+    cell blacklist = cs~load_ref();
+
+    ;; Yeni bir builder oluşturun
+    builder b = begin_cell();
+
+    ;; Eğer blacklist boşsa, yeni bir cell oluştur
+    if (is_empty_cell(blacklist)) {
+        if (is_add) {
+            b.store_slice(ip);
+        }
+    } else {
+        var parser = blacklist.begin_parse();
+        
+        ;; Slice boş değilse döngüye gir
+        while (not(parser.slice_empty?())) {
+            slice blacklisted_ip = parser~load_slice();
+            if ((not(is_add) & (slice_hash(blacklisted_ip) == slice_hash(ip))) | (is_add & not(slice_hash(blacklisted_ip) == slice_hash(ip)))) {
+                b.store_slice(blacklisted_ip);
+            }
+        }
+
+        ;; Eğer IP ekleyeceksek ve mevcut değilse, IP'yi güncellenmiş blacklist'e ekleyin
+        if (is_add) {
+            b.store_slice(ip);
+        }
+    }
+
+    ;; Güncellenmiş blacklist'i storage_data'ya kaydedin
+    storage_data = begin_cell()
+        .store_ref(b.end_cell()) ;; Builder'ı cell'e dönüştür
+        .end_cell();
+}
+
+;; İki slice'ı karşılaştıran fonksiyon
+int compare_slices(slice s1, slice s2) inline {
+    return slice_hash(s1) == slice_hash(s2) ? 0 : 1;
+}
+
+() update_user_data(slice user_ip, slice username) impure {
+    var cs = storage_data.begin_parse();
+    cell user_data = cs~load_ref();
+    builder updated_user_data = begin_cell();
+    
+    while (not(user_data.slice_empty?())) {
+        updated_user_data.store_slice(user_data~load_slice());
+    }
+    updated_user_data.store_slice(user_ip);
+    updated_user_data.store_slice(username);
+    storage_data = begin_cell()
+        .store_ref(updated_user_data.end_cell())
+        .end_cell();
+}
+
+int check_restricted_destination(slice msg, slice restricted_address_wc, slice restricted_address_hash) inline_ref {
+    var cs = msg.begin_parse();
+    var flags = cs~load_uint(4);
+    if (flags & 8) {
+        return 0;
+    }
+    var dest_addr = cs~load_msg_addr();
+    var (dest_wc, dest_hash) = parse_std_addr(dest_addr);
+    return (dest_wc == restricted_address_wc) and (dest_hash == restricted_address_hash);
+}
+
+;; Reentrancy guard
+int reentrancy_guard() inline_ref {
+    var cs = storage_data.begin_parse();
+    return cs~load_uint(8) == 0;
+}
+
+() set_reentrancy_guard(int state) inline {
+    storage_data = begin_cell()
+        .store_uint(state ? 1 : 0, 8)
+        .end_cell();
+}
+
+;; Contract methods
+() init(slice admin_addr) impure {
+    storage_data = begin_cell()
+        .store_slice(admin_addr)
+        .store_uint(0, 32) ;; current_seqno
+        .store_uint(0, 64) ;; novacoin_balance
+        .store_ref(begin_cell().end_cell()) ;; user_data
+        .store_uint(INITIAL_ENERGY, 32) ;; energy
+        .store_uint(0, 32) ;; click_boost
+        .store_uint(0, 32) ;; energy_boost
+        .store_ref(begin_cell().end_cell()) ;; blacklist
+        .store_uint(0, 32)  ;;last_airdrop
+        .store_ref(begin_cell().end_cell()) ;; staking_data
+        .end_cell();
+    set_reentrancy_guard(0);
+}
+
+() set_admin(slice new_admin) impure {
+    var cs = storage_data.begin_parse();
+    slice admin_addr = cs~load_slice();
+    throw_unless(admin_addr == get_sender_address(), 1);
+    storage_data = begin_cell()
+        .store_slice(new_admin)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() stake(int amount) impure {
+    throw_unless(amount > 0, 2);
+    var cs = storage_data.begin_parse();
+    int novacoin_balance = cs~load_uint(64);
+    throw_unless(amount <= novacoin_balance, 3);
+
+    ;; Add stake logic here
+
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(novacoin_balance - amount, 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() update_boost(int boost_cost, int boost_amount, int is_energy_boost) impure {
+    var cs = storage_data.begin_parse();
+    int novacoin_balance = cs~load_uint(64);
+    throw_unless(novacoin_balance >= boost_cost, is_energy_boost ? 4 : 5);
+    novacoin_balance -= boost_cost;
+    int energy_or_click_boost = cs~load_uint(32);
+    energy_or_click_boost += boost_amount;
+
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(novacoin_balance, 64)
+        .store_ref(cs~load_ref())
+        .store_uint(is_energy_boost ? min(energy_or_click_boost, MAX_ENERGY) : energy_or_click_boost, 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() boost_energy() impure {
+    update_boost(BOOST_ENERGY_COST, BOOST_CLICK_COST, 1);
+}
+
+() boost_click() impure {
+    update_boost(BOOST_CLICK_COST, BOOST_ENERGY_COST, 0);
+}
+
+() transfer(slice destination) impure {
+    var cs = storage_data.begin_parse();
+    slice admin_addr = cs~load_slice();
+    throw_unless(admin_addr == get_sender_address(), 6);
+    int amount = cs~load_uint(32);
+    throw_unless(amount > 0, 7);
+    slice msg = begin_cell().store_slice(destination).store_uint(amount, 32).end_cell().begin_parse();
+    throw_unless(check_restricted_destination(msg, 0, 0), 8);
+    ;; actual transfer logic here
+}
+
+() airdrop() impure {
+    var cs = storage_data.begin_parse();
+    int last_airdrop = cs~load_uint(32);
+    int current_time_val = current_time();
+    throw_unless(current_time_val - last_airdrop >= ENERGY_RECHARGE_INTERVAL, 9);
+    int energy = cs~load_uint(32);
+    energy = min(energy + 100, MAX_ENERGY);
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(cs~load_ref())
+        .store_uint(energy, 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(current_time_val, 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() process_payment(int amount) impure {
+    var cs = storage_data.begin_parse();
+    int novacoin_balance = cs~load_uint(64);
+    novacoin_balance += amount;
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(novacoin_balance, 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .end_cell();
+}
+
+() update_staking_data(int new_data) impure {
+    var cs = storage_data.begin_parse();
+    cell staking_data = cs~load_ref();
+    builder updated_staking_data = begin_cell();
+    while (not(staking_data.slice_empty?())) {
+        updated_staking_data.store_slice(staking_data~load_slice());
+    }
+    updated_staking_data.store_uint(new_data, 32);
+    storage_data = begin_cell()
+        .store_slice(cs~load_slice())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(64), 64)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(cs~load_ref())
+        .store_uint(cs~load_uint(32), 32)
+        .store_ref(updated_staking_data.end_cell())
+        .end_cell();
+}

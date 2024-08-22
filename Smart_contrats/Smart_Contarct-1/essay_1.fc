@@ -1,0 +1,223 @@
+#include "stdlib.fc";
+
+;; Constants
+const int MIN_STAKE_AMOUNT = 1000;  
+const int FAILED_ATTEMPTS_THRESHOLD = 5;  
+const int VESTING_PERIOD = 30 * 24 * 60 * 60;  
+const int BLACKLIST_DURATION = 7 * 24 * 60 * 60;  
+
+;; Admin address
+const slice ADMIN_ADDRESS = slice("your-toonkeper-wallet-address"); 
+
+;; Global variables
+global cell blacklist;  
+global map failedAttempts;  
+global int lastActionTimestamp;  
+global map userCooldown;  
+global map userStakeTimestamp;  
+global map blacklistTime;  
+global cell userData;  
+
+;; Admin control 
+() checkAdmin(slice caller) impure {
+    require(caller == ADMIN_ADDRESS, 100, "Bu işlemi gerçekleştirmek için admin olmalısınız.");
+}
+
+;; Loading initial values
+() initializeGlobals() impure inline {
+    blacklist = begin_cell().end_cell();  
+    failedAttempts = begin_map().end_map();
+    lastActionTimestamp = now(); 
+    userCooldown = begin_map().end_map();  
+    userStakeTimestamp = begin_map().end_map();  
+    blacklistTime = begin_map().end_map();  
+}
+
+;; Check if the user is on a blacklist
+int isBlacklisted(slice userIP) method_id {
+    checkAndUpdateBlacklist(userIP);  
+    cell ref = blacklist;
+    while (ref.slice_refs() > 0) {
+        slice entry = ref.begin_parse().load_slice();
+        ref = ref.load_ref().as_cell();
+        if (entry == userIP) {
+            return 1;  
+        }
+    }
+    return 0;  
+}
+
+;; Update blacklist
+() checkAndUpdateBlacklist(slice userIP) impure {
+    int blacklistEntryTime = blacklistTime.get(userIP, 0);
+    if (blacklistEntryTime != 0 and (now() - blacklistEntryTime > BLACKLIST_DURATION)) {
+        removeFromBlacklist(userIP);  
+    }
+}
+
+;; Function to blacklist a user
+() addToBlacklist(slice userIP) impure {
+    checkAdmin(msg.caller());  
+    blacklist = begin_cell().store_slice(userIP).store_ref(blacklist).end_cell();  
+    blacklistTime = blacklistTime.set(userIP, now()); 
+}
+
+;; Removing a user from the blacklist 
+() removeFromBlacklist(slice userIP) impure {
+    checkAdmin(msg.caller());  
+    
+    
+    cell newBlacklist = begin_cell().end_cell();
+    cell ref = blacklist;
+
+    while (ref.slice_refs() > 0) {
+        slice entry = ref.begin_parse().load_slice();
+        ref = ref.load_ref().as_cell();
+        
+
+        if (entry != userIP) {
+            newBlacklist = begin_cell().store_slice(entry).store_ref(newBlacklist).end_cell();
+        }
+    }
+    
+
+    blacklist = newBlacklist;
+    
+
+    blacklistTime = blacklistTime.delete(userIP);
+}
+
+;; Function to increment the number of failed operations
+() incrementFailedAttempts(slice userIP) impure {
+    int currentAttempts = failedAttempts.get(userIP, 0);
+    currentAttempts = currentAttempts + 1;
+    failedAttempts = failedAttempts.set(userIP, currentAttempts);
+
+    if (currentAttempts >= FAILED_ATTEMPTS_THRESHOLD) {
+        addToBlacklist(userIP);  
+        failedAttempts = failedAttempts.delete(userIP); 
+    }
+}
+
+;; Standby time control for the user
+() checkCooldown(slice userIP) impure {
+    int lastActionTime = userCooldown.get(userIP, 0);
+    require(now() - lastActionTime >= 24 * 60 * 60, 110, "You must wait 24 hours to carry out this operation.");
+}
+
+;; Update waiting time for the user
+() updateCooldown(slice userIP) impure {
+    userCooldown = userCooldown.set(userIP, now());
+}
+
+;; Token staking function
+() stakeTokens(int amount, slice userIP) impure {
+    checkCooldown(userIP); 
+    int blacklisted = isBlacklisted(userIP);  
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    require(amount >= MIN_STAKE_AMOUNT, 108, "The minimum amount to stake is 1000 NOVA.");  
+
+    userStakeTimestamp = userStakeTimestamp.set(userIP, now());  
+    updateCooldown(userIP);  
+}
+
+;; Token withdrawal function
+() unstakeTokens(int amount, slice userIP) impure {
+    int stakeTime = userStakeTimestamp.get(userIP, 0);
+    require(now() - stakeTime >= VESTING_PERIOD, 111, "Staked tokens cannot be withdrawn for 30 days.");  
+    checkCooldown(userIP);  
+    int blacklisted = isBlacklisted(userIP); 
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    updateCooldown(userIP);  
+}
+
+;; Reward claiming function
+() claimRewards(slice userIP) impure {
+    checkCooldown(userIP);  
+    int blacklisted = isBlacklisted(userIP);  
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    incrementFailedAttempts(userIP);  
+}
+
+;; Boost 1 
+() useBoost1(slice userIP) impure {
+    checkCooldown(userIP);  
+    int blacklisted = isBlacklisted(userIP);  
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    require(energy >= 1, 102, "Insufficient energy.");
+    reward = reward + 1;
+    energy = energy - 1;
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userIP);  
+}
+
+;; Boost 2 
+() useBoost2(slice userIP) impure {
+    checkCooldown(userIP); 
+    int blacklisted = isBlacklisted(userIP);  ;
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    require(energy >= 1, 103, "Insufficient energy.");
+    energy = energy + 500;  
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userIP);  
+}
+
+;; Boost 1 updating
+() upgradeBoost1(slice userIP) impure {
+    checkCooldown(userIP); 
+    int blacklisted = isBlacklisted(userIP);  
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    require(boost1Level < 15, 104, "Boost1 level has reached the highest level.");
+    boost1Level = boost1Level + 1;
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userIP);  
+}
+
+;; Boost 2 updating
+() upgradeBoost2(slice userIP) impure {
+    checkCooldown(userIP);  
+    int blacklisted = isBlacklisted(userIP);  
+
+    require(blacklisted == 0, 109, "The transaction cannot be processed because the user is blacklisted.");
+
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    require(boost2Level < 15, 105, "Boost2 level has reached its highest level.");
+    boost2Level = boost2Level + 1;
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userIP); 
+}
+
+;; Current functions for general operations
+() transferTON(slice recipient, int amount) impure {
+   
+}
+
+slice get_data() impure {
+    return userData;
+}
+
+() set_data(slice data) impure {
+    userData = data;
+}
+
+;; An input function for testing purposes
+() testFunction() impure {
+    int result = 0;
+    result = isBlacklisted(slice("testUserIP")); 
+
+}

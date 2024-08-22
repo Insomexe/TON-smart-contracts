@@ -1,0 +1,537 @@
+#include "stdlib.fc";
+
+;; Constants
+const int FIXED_TIMESTAMP = 1700000000;
+const int AIRDROP_TIME = FIXED_TIMESTAMP;
+const int MIN_STAKE_AMOUNT = 1000;  
+const int FAILED_ATTEMPTS_THRESHOLD = 5;  
+const int VESTING_PERIOD = 7 * 30 * 24 * 60 * 60;  
+const int BLACKLIST_DURATION = 7 * 24 * 60 * 60;  
+const int REFERRAL_BONUS_FOR_REFEREE = 500;  
+const int REFERRAL_BONUS_FOR_REFERRER = 500; 
+const BASE_BOOST_COST = 1000;  
+const BOOST_COST_INCREMENT = 1000;  
+const int MAX_REFERRAL_BONUS = 10000;
+
+
+
+;; Global variables
+global cell ReferralLinks;
+global cell UserReferans;
+global cell blacklist;  
+global cell userCooldown; 
+global cell userStakeTimestamp;  
+global cell blacklistTime;  
+global cell userData;  
+global int vault;  
+global cell userStakeAmounts;  
+global int totalStakeAmount;
+global cell userLogs;  
+global int admin;
+global int locked;
+global int airdrop_active;
+global cell failedAttempts; 
+global int admin_address;
+
+;; Data logging 
+(slice, slice, slice, int, int, cell, cell, cell, cell) storage::load_data() inline {
+    slice ds = get_data().begin_parse();
+    return (ds~load_msg_addr(), ds~load_msg_addr(), ds~load_msg_addr(), ds~load_uint(64), ds~load_uint(64), ds~load_dict(), ds~load_dict(), ds~load_dict(), ds~load_dict());
+}
+
+
+;;Printing data 
+() storage::save_data(slice jettonWallet, slice jettonMinter, slice admin, int max_provider, int last_job_id, cell provider_list, cell job_list, cell active_jobId, cell provider_list_for_choising) impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(jettonWallet)
+            .store_slice(jettonMinter)
+            .store_slice(admin)
+            .store_uint(max_provider, 64)
+            .store_uint(last_job_id, 64)
+            .store_dict(provider_list)
+            .store_dict(job_list)
+            .store_dict(active_jobId)
+            .store_dict(provider_list_for_choising)
+        .end_cell()
+    );
+}
+
+
+() initializeAdmin(int addr) impure {
+    if (admin_address != 0) {
+        throw(101);
+    }
+    admin_address = addr;
+}
+
+
+
+;; Setting the admin address during contract initialization
+() main() impure inline {
+    initializeGlobals();  
+    initializeAdmin(get_sender());  
+}
+
+
+() someAdminOnlyFunction() impure {
+    require_admin();  ;; Only people with admin privileges can use this 
+}
+
+
+;; Loading initial values
+() initializeGlobals() impure inline {
+    blacklist = begin_cell().end_cell();  
+    failedAttempts = begin_map().end_map();  
+    lastActionTimestamp = now();  
+    userCooldown = begin_cell().end_cell();  
+    userStakeTimestamp = begin_cell().end_cell();   
+    blacklistTime = begin_map().end_map();  
+    vault = 0;  
+    userStakeAmounts = begin_map().end_map();  
+    totalStakeAmount = 0;  
+}
+
+;; Check if the user is on a blacklist 
+int isBlacklisted() impure {
+    slice userIP = getUserIP();  
+    checkAndUpdateBlacklist(userIP);  
+    cell ref = blacklist;
+    while (ref.slice_refs() > 0) {
+        slice entry = ref.begin_parse().load_slice();
+        ref = ref.load_ref().as_cell();
+        if (entry == userIP) {
+            return 1;  
+        }
+    }
+    return 0;  
+}
+
+;; Updating the blacklist 
+void checkAndUpdateBlacklist(slice userIP) impure {
+    int blacklistEntryTime = blacklistTime.get(userIP, 0);
+    if (blacklistEntryTime != 0 and (now() - blacklistEntryTime > BLACKLIST_DURATION)) {
+        removeFromBlacklist(userIP);  
+    }
+}
+
+;; Check if the user is on a blacklist 
+int isBlacklisted(slice userIP) impure {
+    checkAndUpdateBlacklist(userIP);  
+    return blacklist.has(userIP) ? 1 : 0;  
+}
+
+
+;; Add a user to the blacklist
+void addToBlacklist(slice userIP) impure {
+    checkAdmin(msg.caller());  
+    cell newBlacklist = begin_cell().store_slice(userIP).store_ref(blacklist).end_cell();  
+    blacklist = newBlacklist;  
+    blacklistTime = blacklistTime~dict_set(userIP, now());  
+}
+
+
+;; Removing a user from the blacklist
+() removeFromBlacklist(slice userIP) impure {
+    checkAdmin(msg.caller());  
+    
+    cell newBlacklist = begin_cell().end_cell();
+    cell ref = blacklist;
+    
+    while (ref.slice_refs() > 0) {
+        slice entry = ref.begin_parse().load_slice();
+        ref = ref.load_ref().as_cell();
+        
+        if (entry != userIP) {
+            newBlacklist = begin_cell().store_slice(entry).store_ref(newBlacklist).end_cell();
+        }
+    }
+    
+    blacklist = newBlacklist;
+    blacklistTime = blacklistTime~dict_delete(userIP);  
+}
+
+
+;; Automatically fetches the user's IP address
+slice getUserIP() inline {
+    return msg.caller();  
+}
+
+
+;; Increase the number of failed transactions
+() incrementFailedAttempts(slice userIP) impure {
+    cell attemptsCell = failedAttempts~dict_get(userIP);
+    int currentAttempts = (attemptsCell == nul()) ? 0 : attemptsCell~begin_parse().load_uint(32);
+    currentAttempts = currentAttempts + 1;
+    
+    cell newAttemptsCell = begin_cell().store_uint(currentAttempts, 32).end_cell();
+    failedAttempts = failedAttempts~dict_set(userIP, newAttemptsCell);
+
+    if (currentAttempts >= FAILED_ATTEMPTS_THRESHOLD) {
+        addToBlacklist(userIP);  
+        failedAttempts = failedAttempts~dict_delete(userIP);  
+    }
+}
+
+;; Standby time control for the user
+int checkCooldown(slice userIP) impure {
+    cell ref = userCooldown;
+    while (ref.slice_refs() > 0) {
+        slice entry = ref.begin_parse().load_slice();
+        int lastActionTime = entry.load_uint(32);
+
+        if (entry == userIP) {
+            if (now() - lastActionTime < 24 * 60 * 60) {
+                return 1;  
+            }
+        }
+
+        ref = ref.load_ref().as_cell();
+    }
+    return 0;  
+}
+
+;; Update waiting time for the user
+() updateCooldown(slice userIP) impure {
+    cell newCooldown = begin_cell().store_slice(userIP).store_uint(now(), 32).end_cell();
+    userCooldown = begin_cell().store_ref(newCooldown).store_ref(userCooldown).end_cell();  
+}
+ 
+;; NovaCoin mining and earning rewards 
+() pressCoin(slice userName) impure {
+    refillEnergy();  
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(userName);
+    consumeEnergy(1);  
+
+    int stakedAmount = userStakeAmounts.get(msg.caller(), 0);
+
+    reward = reward + 1 + boost2Level;
+    saveUser(userName, balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userName);  
+}
+
+
+;; NovaCoin (Energy) replenishment
+() refillEnergy() impure {
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+
+    int elapsed = now() - lastUpdate;
+    int hoursPassed = elapsed / (3 * 60 * 60);  
+
+    if (hoursPassed > 0) {
+        energy = energy + (hoursPassed * 100);  
+        lastUpdate = now();
+        saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    }
+}
+
+;; Energy (NovaCoin) consumption
+() consumeEnergy(int amount) impure {
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+
+    require(energy >= amount, 102, "Insufficient energy.")
+    energy = energy - amount;
+
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+}
+
+void useBoost1(slice userName) impure {
+    refillEnergy();  
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    consumeEnergy(1);  
+
+    require(boost1Level < 15, 104, "Boost1 level reaches the highest level.");
+    var boost1Cost = 1000 * (boost1Level + 1);  
+    require(balance >= boost1Cost, 105, "Insufficient balance to upgrade Boost1.");
+
+    balance = balance - boost1Cost;
+    boost1Level = boost1Level + 1;
+    
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+    updateCooldown(userName);  
+}
+
+;; Boost 2 redemption function (Earn Extra NovaCoin with Every Press)
+() useBoost2(slice userName) impure {
+    refillEnergy();  
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(get_data().begin_parse());
+    consumeEnergy(1);  
+    
+    require(boost2Level < 15, 104, "Boost2 level reaches the highest level.");
+
+    ;; Calculating the cost of boost: 1000 + (level * 1000)
+    var boost2Cost = 1000 * (boost2Level + 1);  
+    require(balance >= boost2Cost, 105, "Insufficient balance to upgrade Boost2.");
+    
+    balance = balance - boost2Cost;
+    boost2Level = boost2Level + 1;
+
+    saveUser(balance, reward, lastUpdate, energy, boost1Level, boost2Level);
+
+    updateCooldown(userName);  
+}
+
+
+;; Staking - depositing coins
+() stakeCoins(int amount) impure {
+    require(amount >= MIN_STAKE_AMOUNT, 106, "Failed to exceed the minimum stake.");
+
+    slice userName = get_data().begin_parse();
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(userName);
+
+    userStakeAmounts = userStakeAmounts~dict_set(msg.caller(), amount);
+    totalStakeAmount = totalStakeAmount + amount;
+    vault = vault + amount;
+
+    cell stakeTimeCell = begin_cell().store_uint(now(), 64).end_cell();
+    userStakeTimestamp = userStakeTimestamp~dict_set(msg.caller(), stakeTimeCell);
+}
+
+;; Controlling the user's staking time
+int checkStakePeriod(slice user) impure {
+    cell stakeTimeCell = userStakeTimestamp~dict_get(user);
+    if (stakeTimeCell == nul()) {
+        return 0; 
+    }
+    int stakeTime = stakeTimeCell~begin_parse().load_uint(64);
+    if (now() - stakeTime >= VESTING_PERIOD) {
+        return 1;  
+    }
+    return 0;  
+}
+
+
+;; Returns the total amount of stakes
+int totalStaked() method_id {
+    return totalStakeAmount;
+}
+
+;; Reference link creation 
+slice generateReferralLink(slice userName) impure {
+    cell referralCell = begin_cell()
+        .store_uint(now(), 64)    
+        .store_slice(userName)    
+        .end_cell();
+    slice referralLink = referralCell~begin_parse();
+
+    ReferralLinks = ReferralLinks~dict_set(userName, referralLink);
+    
+    return referralLink; 
+}
+
+
+;; registering by reference
+void registerWithReferral(slice referralLink, slice newUserName) impure {
+    slice referrerName = referralLinks~dict_get(referralLink);
+    if (referrerName == nul()) {
+        throw(102);
+    }
+
+saveUser(newUserName, 0, REFERRAL_BONUS_FOR_REFEREE, now(), 0, 0, 0);
+
+ var (referrer, referrerBalance, referrerReward, referrerLastUpdate, referrerEnergy, referrerBoost1, referrerBoost2) = loadUser(referrerName);
+    saveUser(referrerName, referrerBalance, referrerReward + REFERRAL_BONUS_FOR_REFERRER, referrerLastUpdate, referrerEnergy, referrerBoost1, referrerBoost2);
+}
+
+void inviteUser(slice userName) impure{
+    slice referralLink = generateReferralLink(userName);
+
+}
+
+;; Reentrancy protect
+void lock() impure {
+    if (locked == 1) {
+        throw(102); 
+    }
+    locked = 1;
+}
+
+void unlock() impure {
+    locked = 0;
+}
+
+;;Function usage limitations
+int distribute_bonus(int amount) impure {
+    if (amount > MAX_REFERRAL_BONUS) {
+        throw(103); 
+    }
+}
+
+;; Log insertion function
+() addLog(slice userName, slice action, int timestamp) impure {
+    checkAdmin(msg.caller());  
+
+    cell logEntry = begin_cell()
+        .store_slice(userName)
+        .store_slice(action)
+        .store_uint(timestamp, 32)
+        .end_cell();
+    
+    userLogs = userLogs~dict_set(userName, logEntry);
+}
+
+(slice, slice, int) viewLogs(slice userName) method_id {
+    checkAdmin(msg.caller());  
+
+    cell logEntry = userLogs~dict_get(userName);
+    
+    slice entrySlice = logEntry.begin_parse();
+    slice action = entrySlice.load_slice();
+    int timestamp = entrySlice.load_uint(32);
+    
+    return (userName, action, timestamp);
+}
+
+;; Initializes global variables first when the function is started
+() main() impure inline {
+    initializeGlobals();
+}
+
+
+;; ;; Returns user data
+slice getUserData(slice userName) method_id {
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(userName);
+    return slice(begin_cell().store_coins(balance).store_coins(reward).store_uint(lastUpdate, 32).store_uint(energy, 32).store_uint(boost1Level, 32).store_uint(boost2Level, 32).end_cell());
+}
+
+;; Durum kontrolü için flagler 
+void start_airdrop() impure {
+    airdrop_active = 1;
+}
+
+void stop_airdrop() impure {
+    airdrop_active = 0;
+}
+
+void require_airdrop_active() inline {
+    if (not airdrop_active) {
+        throw(104); 
+    }
+}
+
+;; Error Checking 
+
+;; require for similar checks
+int check_conditions(int value) {
+    if (value <= 0) {
+        throw(100); 
+    }
+    return value;
+}
+
+;;Admin authorization and Authentication 
+void set_admin(int addr) impure {
+    admin = addr;
+}
+
+void require_admin() inline {
+    if (get_sender() != admin) {
+        throw(101);
+    }
+}
+
+;; Testler
+
+void runAllTests() impure {
+    testInitializeAdmin();
+    testBlacklistFunctions();
+    testEnergyFunctions();
+    testBoostFunctions();
+    testStakeCoins();
+    testReferralFunctions();
+    testViewLogs();
+
+    printf("All tests are successful.");
+}
+
+;; Test to set the admin address
+void testInitializeAdmin() impure {
+    slice adminAddress1 = slice("AdminAddress1");
+    slice adminAddress2 = slice("AdminAddress2");
+
+    initializeAdmin(adminAddress1);
+    require(admin == adminAddress1, 1, "Admin address was not set correctly.");
+    bool adminAlreadySet = admin == adminAddress1;
+    require(adminAlreadySet, 2, "Admin address should not be set more than once.");
+}
+
+
+
+void testBlacklistFunctions() impure {
+    slice userIP = slice("UQIP123456789");
+
+    
+    addToBlacklist(userIP);
+    
+    int isInBlacklist = isBlacklisted();
+    require(isInBlacklist == 1, 2, "The user could not be added to the blacklist.");
+    
+    removeFromBlacklist(userIP);
+    
+    isInBlacklist = isBlacklisted();
+    require(isInBlacklist == 0, 3, "User could not be removed from the blacklist.");
+}
+
+void testEnergyFunctions() impure {
+    slice userName = slice("User1");
+   
+    refillEnergy();
+    var (balance, reward, lastUpdate, energy, boost1Level, boost2Level) = loadUser(userName);
+    int initialEnergy = energy;
+
+    consumeEnergy(10);
+
+    var (_, _, _, energyAfterConsume, _, _) = loadUser(userName);
+    require(energyAfterConsume == initialEnergy - 10, 4, "Failed energy depletion test.");
+}
+
+void testBoostFunctions() impure {
+    slice userName = slice("User1");
+
+    var (_, _, _, _, initialBoost1, _) = loadUser(userName);
+    useBoost1(userName);
+    var (_, _, _, _, boost1AfterUse, _) = loadUser(userName);
+    require(boost1AfterUse == initialBoost1 + 1, 5, "Boost1 test failed.");
+
+    var (_, _, _, _, _, initialBoost2) = loadUser(userName);
+    useBoost2(userName);
+    var (_, _, _, _, _, boost2AfterUse) = loadUser(userName);
+    require(boost2AfterUse == initialBoost2 + 1, 6, "Boost2 test failed.");
+}
+
+void testStakeCoins() impure {
+    slice userName = slice("User1");
+    int initialStakeAmount = 10000;
+
+    stakeCoins(initialStakeAmount);
+
+    int stakedAmount = totalStaked();
+    require(stakedAmount == initialStakeAmount, 7, "Staking test failed.");
+}
+
+void testReferralFunctions() impure {
+    slice userName = slice("Referrer");
+    slice newUserName = slice("NewUser");
+
+    slice referralLink = generateReferralLink(userName);
+
+    registerWithReferral(referralLink, newUserName);
+
+    var (_, reward, _, _, _, _) = loadUser(newUserName);
+    require(reward == REFERRAL_BONUS_FOR_REFEREE, 8, "Failed to load referral bonus.");
+}
+
+void testViewLogs() impure {
+    slice userName = slice("User1");
+    slice action = slice("Action1");
+    int timestamp = now();
+
+    addLog(userName, action, timestamp);
+
+    var (logUser, logAction, logTimestamp) = viewLogs(userName);
+
+    require(logUser == userName, 7, "Log username test failed.");
+    require(compareSlices(logAction, action), 8, "Log action test failed."); 
+    require(logTimestamp == timestamp, 9, "Log timestamp test failed.");
+}
+
